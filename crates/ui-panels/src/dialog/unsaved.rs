@@ -49,10 +49,11 @@ impl Outcome for UnsavedChangesOutput {
     }
 }
 
-/// The question for one modified document: a prompt titled "Unsaved changes" with the document's name in the
-/// message, Save (the accepting answer), Don't Save and Cancel in the platform's order and words, and, while the
-/// guard has more documents, an "Apply to All" check box. Windows and Linux ask Yes, No and Cancel. Reverting asks
-/// Revert and Cancel; Revert answers `CloseAnswer::DontSave`.
+/// The question for one modified document: an alert dialog (`Role::ALERT_DIALOG`) titled "Unsaved changes" with the
+/// document's name in the message, Save (the accepting answer), Don't Save and Cancel in the platform's order and
+/// words, and, while the guard has more documents, an "Apply to All" check box. Windows and Linux ask Yes, No and
+/// Cancel. Reverting asks Revert and Cancel; Revert answers `CloseAnswer::DontSave`. A save failure reason is shown in
+/// bad tone and folded into the AccessKit alert description.
 ///
 /// The result is `Ok(UnsavedAnswer)` for every answer, Cancel included (the guard needs it), and
 /// `DialogResult::Cancel` only when the host closed the dialog from outside.
@@ -164,7 +165,7 @@ impl UnsavedChangesDialog {
         let replies = self.replies(&words, common.cancel.clone(), env.view().shell().os);
         let answers: Vec<CloseAnswer> = replies.iter().map(|(answer, _)| *answer).collect();
         let replies: Vec<Reply> = replies.into_iter().map(|(_, reply)| reply).collect();
-        let mut prompt = Prompt::new(words.unsaved_title.clone(), message).answers(buttons(&env, replies));
+        let mut prompt = Prompt::new(words.unsaved_title.clone(), message).alert().answers(buttons(&env, replies));
         if let Some(reason) = &self.reason {
             prompt = prompt.tone(Tone::Bad, reason.clone());
         }
