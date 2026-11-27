@@ -220,7 +220,14 @@ impl<C: Collection> ItemsHooks<'_, '_, C> {
         match props.space {
             SpaceAction::Activate => match Self::select_mode(comp) {
                 SelectMode::None => self.events.push(CollectionEvent::Activate(self.source.key(row))),
-                mode => self.pick_by(comp, row, false, mode != SelectMode::Single, PickBy::Keys),
+                SelectMode::Single => {
+                    let already = self.holds(row);
+                    self.pick_by(comp, row, false, false, PickBy::Keys);
+                    if already && self.holds(row) {
+                        self.events.push(CollectionEvent::Picked { key: self.source.key(row), mods: craft_keymap::Mods::NONE });
+                    }
+                }
+                _ => self.pick_by(comp, row, false, true, PickBy::Keys),
             },
             SpaceAction::ActivateLead => {
                 if crate::contract::steps::takes_activation(cx.core.resolved) {
