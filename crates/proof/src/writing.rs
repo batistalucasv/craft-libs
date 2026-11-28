@@ -1,15 +1,100 @@
 //! Rule-based writing checks across English, Portuguese, and Spanish:
 //! balanced delimiters and quotation marks, bracket/punctuation spacing,
-//! conservative contextual paronyms and homophones, and selected redundancies.
+//! conservative contextual paronyms and homophones, deep grammar, clarity,
+//! readability metrics, open writing quality scoring, and tone analysis.
 //!
 //! All checks operate directly on `&str` and [`ProofLang`] with conservative
 //! guards so numbers, URLs, contractions, measurements, emoticons, list
 //! markers, and inline code stay quiet.
 
+mod clarity;
+mod grammar_deep;
+mod scoring;
+mod tone;
+
 use crate::{Issue, IssueKind, ProofLang};
 
+pub use scoring::{ReadabilityLevel, ReadabilityMetrics, WritingScore};
+pub use tone::{TextSpan, ToneProfile, ToneSignal, ToneSignalKind};
+
+/// Complete deterministic writing analysis output for a text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WritingReport {
+    /// Overall open writing quality score (`0..=100`).
+    pub score: WritingScore,
+    /// Open readability formulas and reading/speaking time estimates.
+    pub readability: ReadabilityMetrics,
+    /// Top dominant tone signals (up to 3) with evidence spans.
+    pub tone: ToneProfile,
+    /// Total word count in the analyzed text.
+    pub words: usize,
+    /// Total sentence count in the analyzed text.
+    pub sentences: usize,
+    /// Non-empty paragraph count in the analyzed text.
+    pub paragraphs: usize,
+    /// Total proofing issues detected (`issues.len()`).
+    pub issue_count: usize,
+    /// All proofing issues across paragraphs with document-relative UTF-8 byte offsets.
+    pub issues: Vec<Issue>,
+}
+
+/// Runs deterministic spelling, grammar, clarity, readability, score, and tone
+/// analysis on `text` for `lang`.
+pub fn analyze_writing(text: &str, lang: ProofLang) -> WritingReport {
+    let counts = scoring::measure_text(text);
+    let readability = scoring::compute_readability(text, counts, lang);
+    let tone = tone::analyze_tone(text);
+
+    if text.trim().is_empty() {
+        return WritingReport {
+            score: WritingScore::default(),
+            readability,
+            tone,
+            words: counts.words,
+            sentences: counts.sentences,
+            paragraphs: counts.paragraphs,
+            issue_count: 0,
+            issues: Vec::new(),
+        };
+    }
+
+    let mut issues = Vec::new();
+    for (para_start, para_text) in paragraph_slices(text) {
+        let mut found = crate::check_text(para_text, &[(0..para_text.len(), lang)]);
+        for issue in &mut found {
+            issue.start = issue.start.saturating_add(para_start);
+            issue.end = issue.end.saturating_add(para_start);
+        }
+        issues.extend(found);
+    }
+
+    let score = WritingScore::compute(&issues, counts.words);
+    let issue_count = issues.len();
+
+    WritingReport { score, readability, tone, words: counts.words, sentences: counts.sentences, paragraphs: counts.paragraphs, issue_count, issues }
+}
+
+fn paragraph_slices(text: &str) -> Vec<(usize, &str)> {
+    let mut slices = Vec::new();
+    let mut offset = 0usize;
+    for raw_line in text.split_inclusive('\n') {
+        let trimmed = raw_line.trim_end_matches(['\r', '\n']);
+        if !trimmed.trim().is_empty() {
+            slices.push((offset, trimmed));
+        }
+        offset = offset.saturating_add(raw_line.len());
+    }
+    if offset < text.len()
+        && let Some(tail) = text.get(offset..)
+        && !tail.trim().is_empty()
+    {
+        slices.push((offset, tail));
+    }
+    slices
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LangGroup {
+pub(super) enum LangGroup {
     En,
     Pt,
     Es,
@@ -435,8 +520,8 @@ const PT_REDUNDANCIES: &[(&str, &str)] = &[
 const ES_REDUNDANCIES: &[(&str, &str)] =
     &[("subir para arriba", "subir"), ("bajar para abajo", "bajar"), ("entrar para adentro", "entrar"), ("salir para afuera", "salir")];
 
-/// Runs conservative delimiter/quote, spacing, contextual paronym, and
-/// redundancy checks for English, Portuguese, and Spanish text.
+/// Runs conservative delimiter/quote, spacing, contextual paronym,
+/// redundancy, deep grammar, and clarity checks for English, Portuguese, and Spanish text.
 pub(crate) fn check(text: &str, lang: ProofLang) -> Vec<Issue> {
     let Some(group) = lang_group(lang) else {
         return Vec::new();
@@ -454,14 +539,43 @@ pub(crate) fn check(text: &str, lang: ProofLang) -> Vec<Issue> {
     check_contextual(text, &folded, group, lang, &mut out);
     check_redundancies(text, &folded, group, lang, &mut out);
 
+    let mut deep = Vec::new();
+    grammar_deep::check(text, &folded, group, lang, &mut deep);
+    push_non_overlapping(&mut out, deep);
+
+    let mut clear = Vec::new();
+    clarity::check(text, &folded, group, lang, &mut clear);
+    push_clarity(&mut out, clear);
+
     out.sort_by_key(|i| (i.start, i.end));
     out
 }
 
+fn push_non_overlapping(out: &mut Vec<Issue>, extra: Vec<Issue>) {
+    for issue in extra {
+        if !out.iter().any(|existing| existing.start < issue.end && issue.start < existing.end) {
+            out.push(issue);
+        }
+    }
+}
+
+fn push_clarity(out: &mut Vec<Issue>, extra: Vec<Issue>) {
+    for issue in extra {
+        let exact_dup = out.iter().any(|existing| existing.start == issue.start && existing.end == issue.end);
+        // Sentence- and paragraph-level cadence notes carry no replacements; avoid letting a short
+        // word-level rule inside the sentence hide them, while still guarding exact duplicates and
+        // overlapping word/phrase rules.
+        let overlaps_word_rule = !issue.suggestions.is_empty() && out.iter().any(|existing| existing.start < issue.end && issue.start < existing.end);
+        if !exact_dup && !overlaps_word_rule {
+            out.push(issue);
+        }
+    }
+}
+
 /// Lowercased text paired with a map back to valid UTF-8 byte boundaries in the
 /// original string so arbitrary Unicode input never breaks byte slicing.
-struct FoldedText {
-    lower: String,
+pub(super) struct FoldedText {
+    pub(super) lower: String,
     orig_bounds: Vec<usize>,
 }
 
@@ -489,7 +603,7 @@ impl FoldedText {
         Self { lower, orig_bounds }
     }
 
-    fn map_range(&self, lower_start: usize, lower_end: usize) -> Option<(usize, usize)> {
+    pub(super) fn map_range(&self, lower_start: usize, lower_end: usize) -> Option<(usize, usize)> {
         let orig_start = *self.orig_bounds.get(lower_start)?;
         let orig_end = *self.orig_bounds.get(lower_end)?;
         (orig_start != usize::MAX && orig_end != usize::MAX && orig_start <= orig_end).then_some((orig_start, orig_end))
@@ -782,17 +896,17 @@ fn check_redundancies(text: &str, folded: &FoldedText, group: LangGroup, lang: P
     }
 }
 
-fn left_boundary(text: &str, start: usize) -> bool {
+pub(super) fn left_boundary(text: &str, start: usize) -> bool {
     text.get(..start).and_then(|s| s.chars().next_back()).is_none_or(|c| !c.is_alphanumeric())
 }
 
-fn has_word_boundaries(text: &str, start: usize, end: usize) -> bool {
+pub(super) fn has_word_boundaries(text: &str, start: usize, end: usize) -> bool {
     let left_ok = left_boundary(text, start);
     let right_ok = text.get(end..).and_then(|s| s.chars().next()).is_none_or(|c| !c.is_alphanumeric());
     left_ok && right_ok
 }
 
-fn match_case(original: &str, replacement: &str) -> String {
+pub(super) fn match_case(original: &str, replacement: &str) -> String {
     if original.chars().next().is_some_and(char::is_uppercase) {
         let mut chars = replacement.chars();
         match chars.next() {
@@ -802,6 +916,41 @@ fn match_case(original: &str, replacement: &str) -> String {
     } else {
         replacement.to_owned()
     }
+}
+
+pub(super) fn word_spans(text: &str) -> Vec<(usize, usize, &str)> {
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    for (idx, ch) in text.char_indices() {
+        let is_word = ch.is_alphanumeric() || ch == '-' || ch == '\'';
+        match (start, is_word) {
+            (None, true) => start = Some(idx),
+            (Some(s), false) => {
+                push_trimmed_word(text, s, idx, &mut spans);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        push_trimmed_word(text, s, text.len(), &mut spans);
+    }
+    spans
+}
+
+fn push_trimmed_word<'a>(text: &'a str, raw_start: usize, raw_end: usize, out: &mut Vec<(usize, usize, &'a str)>) {
+    let Some(slice) = text.get(raw_start..raw_end) else {
+        return;
+    };
+    let trimmed_start = slice.trim_start_matches(['-', '\'']);
+    let lead = slice.len() - trimmed_start.len();
+    let trimmed = trimmed_start.trim_end_matches(['-', '\'']);
+    if trimmed.is_empty() || !trimmed.chars().any(char::is_alphabetic) {
+        return;
+    }
+    let start = raw_start + lead;
+    let end = start + trimmed.len();
+    out.push((start, end, trimmed));
 }
 
 #[cfg(test)]
@@ -901,6 +1050,76 @@ mod tests {
         let pt = check_grammar_in("Olá ,mundo.", ProofLang::Pt);
         let comma_marks: Vec<_> = pt.iter().filter(|i| i.start <= 5 && i.end >= 4).collect();
         assert_eq!(comma_marks.len(), 1, "{pt:?}");
+    }
+
+    #[test]
+    fn deep_grammar_checks_and_false_positive_guards() {
+        let en = check_grammar_in("We finished early, however, the list of steps are missing less steps.", ProofLang::En);
+        assert!(en.iter().any(|i| i.suggestions.contains(&"; however, ".into())), "{en:?}");
+        assert!(en.iter().any(|i| i.suggestions == ["is"]), "{en:?}");
+        assert!(en.iter().any(|i| i.suggestions == ["fewer"]), "{en:?}");
+        assert!(check_grammar_in("However, we need less time.", ProofLang::En).is_empty());
+
+        let pt = check_grammar_in("Houveram falhas à partir de hoje e fazem dois anos.", ProofLang::Pt);
+        assert!(pt.iter().any(|i| i.suggestions == ["Houve"]), "{pt:?}");
+        assert!(pt.iter().any(|i| i.suggestions == ["a partir"]), "{pt:?}");
+        assert!(pt.iter().any(|i| i.suggestions == ["faz"]), "{pt:?}");
+        assert!(check_grammar_in("Houveram por bem sair a partir de hoje.", ProofLang::Pt).is_empty());
+
+        let es = check_grammar_in("Pienso de que hubieron muchos cambios.", ProofLang::Es);
+        assert!(es.iter().any(|i| i.suggestions == ["que"]), "{es:?}");
+        assert!(es.iter().any(|i| i.suggestions == ["hubo"]), "{es:?}");
+        assert!(check_grammar_in("Pienso que ya hubieron visto la nota.", ProofLang::Es).is_empty());
+    }
+
+    #[test]
+    fn clarity_nominalizations_passive_long_and_rhythm() {
+        let en = check_grammar_in("We should make a decision after the report was reviewed.", ProofLang::En);
+        assert!(en.iter().any(|i| i.suggestions == ["decide"]), "{en:?}");
+        assert!(en.iter().any(|i| i.message.contains("Passive voice")), "{en:?}");
+        assert!(check_grammar_in("The door is red and the bed was soft.", ProofLang::En).is_empty());
+
+        let pt = check_grammar_in("Vamos fazer uma análise porque o texto foi escrito cedo.", ProofLang::Pt);
+        assert!(pt.iter().any(|i| i.suggestions == ["analisar"]), "{pt:?}");
+        assert!(pt.iter().any(|i| i.message.contains("voz passiva")), "{pt:?}");
+        assert!(check_grammar_in("O projeto está em bom estado hoje.", ProofLang::Pt).is_empty());
+
+        let long = "This sentence deliberately introduces more than thirty ordinary words in one continuous clause so that writers can easily notice when a single sentence carries far too much weight for comfortable reading.";
+        let long_issues = check_grammar_in(long, ProofLang::En);
+        assert!(long_issues.iter().any(|i| i.message.contains("suggested limit: 30")), "{long_issues:?}");
+
+        let monotonous = "We build tools. We test code. We ship updates.";
+        let rhythm_issues = check_grammar_in(monotonous, ProofLang::En);
+        assert!(rhythm_issues.iter().any(|i| i.message.contains("same word")), "{rhythm_issues:?}");
+    }
+
+    #[test]
+    fn analyze_writing_computes_score_readability_and_tones() {
+        let empty = analyze_writing("", ProofLang::En);
+        assert_eq!(empty.score.score, 100);
+        assert_eq!(empty.issue_count, 0);
+        assert!(empty.tone.dominant.is_empty());
+
+        let sample = "Please review this urgent report immediately!\nThank you for your help, and therefore we must decide now.";
+        let report = analyze_writing(sample, ProofLang::En);
+        assert!(report.words >= 15);
+        assert_eq!(report.paragraphs, 2);
+        assert!(report.readability.flesch_reading_ease > 0.0);
+        assert!(report.readability.reading_minutes > 0.0);
+        assert!(report.readability.speaking_minutes > 0.0);
+        assert!(!report.tone.dominant.is_empty() && report.tone.dominant.len() <= 3);
+        for sig in &report.tone.dominant {
+            assert!(!sig.evidence_spans.is_empty());
+            for span in &sig.evidence_spans {
+                assert!(span.slice(sample).is_some());
+            }
+        }
+        assert_eq!(report.score.score, 100, "clean text scores 100: {report:?}");
+
+        let flawed = analyze_writing("Their is less steps and we must make a decision.", ProofLang::En);
+        assert!(flawed.issue_count >= 3, "{flawed:?}");
+        assert!(flawed.score.score < 100);
+        assert!(flawed.score.grammar_issues >= 3);
     }
 
     fn gb_slice(s: &str, i: &Issue) -> String {

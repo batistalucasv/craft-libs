@@ -98,7 +98,7 @@ mod spelling;
 pub mod tr;
 mod user_dict;
 pub mod vi;
-mod writing;
+pub mod writing;
 
 use std::collections::HashSet;
 use std::ops::Range;
